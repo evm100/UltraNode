@@ -14,7 +14,7 @@
 #include "effects.h"
 #include "ws2812.h"
 #include "presence.h"
-#include "driver/gpio.h"
+
 
 static const char *TAG = "APP";
 
@@ -118,6 +118,7 @@ void app_main(void) {
     int led_count = app_config_get_led_count();
     ws2812_init(led_count, led_gpio);
     effects_init(led_count, led_gpio);
+    presence_init();
 
 #if CONFIG_APP_NEAR_LIGHT1_GPIO >= 0
     gpio_reset_pin(CONFIG_APP_NEAR_LIGHT1_GPIO);

@@ -39,6 +39,62 @@ config APP_OTA_SKIP_CERT_VALIDATION
     bool "Skip TLS certificate validation (development only)"
     default n
 
+menu "Presence Sensors"
+
+config APP_ENABLE_PIR
+    bool "Enable PIR motion sensor"
+    default n
+
+config APP_PIR_GPIO
+    int "PIR sensor GPIO"
+    depends on APP_ENABLE_PIR
+    range 0 40
+    default 33
+
+config APP_ENABLE_ULTRASONIC
+    bool "Enable HC-SR04 ultrasonic sensor"
+    default n
+
+config APP_ULTRASONIC_TRIG_GPIO
+    int "Ultrasonic trigger GPIO"
+    depends on APP_ENABLE_ULTRASONIC
+    range 0 40
+    default 26
+
+config APP_ULTRASONIC_ECHO_GPIO
+    int "Ultrasonic echo GPIO"
+    depends on APP_ENABLE_ULTRASONIC
+    range 0 40
+    default 27
+
+config APP_ULTRASONIC_NEAR_CM
+    int "Distance (cm) considered 'near'"
+    depends on APP_ENABLE_ULTRASONIC
+    range 1 500
+    default 50
+
+config APP_PRESENCE_LOW_BRIGHTNESS_PCT
+    int "Brightness when presence detected (%)"
+    range 0 100
+    default 20
+
+config APP_PRESENCE_NEAR_BRIGHTNESS_PCT
+    int "Brightness when near (%)"
+    range 0 100
+    default 100
+
+config APP_NEAR_LIGHT1_GPIO
+    int "GPIO for extra light 1 (-1 to disable)"
+    range -1 40
+    default -1
+
+config APP_NEAR_LIGHT2_GPIO
+    int "GPIO for extra light 2 (-1 to disable)"
+    range -1 40
+    default -1
+
+endmenu
+
 endmenu
 
 menu "UltraLights OTA"

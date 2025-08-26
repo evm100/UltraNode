@@ -10,6 +10,7 @@
 # - Scheduled OTA updates (daily at configured HH:MM) — updates can add new effects
 # - Wi‑Fi + SNTP time sync; NVS persistence for OTA schedule
 # - Clean module separation: ws2812, effects, mqtt, ota, time_sync
+# - Optional PIR and HC-SR04 sensors drive white-light brightness for presence-aware lighting
 #
 # Build
 # idf.py set-target esp32c3

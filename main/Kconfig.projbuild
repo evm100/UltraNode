@@ -41,6 +41,62 @@ config APP_OTA_SKIP_CERT_VALIDATION
 
 endmenu
 
+menu "Sensor Configuration"
+
+config APP_PRESENT_BRIGHTNESS_PCT
+    int "Brightness when presence detected (%)"
+    range 0 100
+    default 10
+
+config APP_NEAR_BRIGHTNESS_PCT
+    int "Brightness when near detected (%)"
+    range 0 100
+    default 100
+
+config APP_NEAR_LIGHT_GPIO1
+    int "Extra GPIO for near state light #1 (-1 to disable)"
+    range -1 39
+    default -1
+
+config APP_NEAR_LIGHT_GPIO2
+    int "Extra GPIO for near state light #2 (-1 to disable)"
+    range -1 39
+    default -1
+
+config APP_USE_PIR
+    bool "Enable PIR motion sensor"
+    default n
+
+config APP_PIR_GPIO
+    int "PIR sensor GPIO"
+    depends on APP_USE_PIR
+    range 0 39
+    default 14
+
+config APP_USE_ULTRASONIC
+    bool "Enable ultrasonic distance sensor"
+    default n
+
+config APP_ULTRASONIC_TRIG_GPIO
+    int "Ultrasonic trigger GPIO"
+    depends on APP_USE_ULTRASONIC
+    range 0 39
+    default 27
+
+config APP_ULTRASONIC_ECHO_GPIO
+    int "Ultrasonic echo GPIO"
+    depends on APP_USE_ULTRASONIC
+    range 0 39
+    default 26
+
+config APP_ULTRASONIC_NEAR_CM
+    int "Distance threshold for near state (cm)"
+    depends on APP_USE_ULTRASONIC
+    range 1 500
+    default 50
+
+endmenu
+
 menu "UltraLights OTA"
 
 config APP_DEVICE_ID

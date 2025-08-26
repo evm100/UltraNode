@@ -6,6 +6,7 @@ idf_component_register(
         "mqtt_ctrl.c"
         "ota_update.c"
         "time_sync.c"
+        "presence.c"
     INCLUDE_DIRS
         "."
     REQUIRES

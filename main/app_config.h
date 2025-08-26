@@ -16,3 +16,17 @@ int app_config_get_led_count(void);
 float app_config_get_default_brightness(void); // returns 0.0..1.0
 bool app_config_ota_skip_cert_validation(void);
 
+#ifdef CONFIG_APP_USE_PIR
+int app_config_get_pir_gpio(void);
+#endif
+#ifdef CONFIG_APP_USE_ULTRASONIC
+int app_config_get_ultrasonic_trig_gpio(void);
+int app_config_get_ultrasonic_echo_gpio(void);
+int app_config_get_ultrasonic_near_cm(void);
+#endif
+
+float app_config_get_present_brightness(void); // returns 0.0..1.0
+float app_config_get_near_brightness(void);    // returns 0.0..1.0
+int app_config_get_near_light_gpio1(void);
+int app_config_get_near_light_gpio2(void);
+

@@ -13,6 +13,7 @@
 #include "time_sync.h"
 #include "effects.h"
 #include "ws2812.h"
+#include "presence.h"
 
 static const char *TAG = "APP";
 
@@ -75,6 +76,7 @@ void app_main(void) {
     int led_count = app_config_get_led_count();
     ws2812_init(led_count, led_gpio);
     effects_init(led_count, led_gpio);
+    presence_init();
 
     effect_t eff; rgb_t col;
     if (state_load(&eff, &col)) {

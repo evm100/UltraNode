@@ -1,0 +1,66 @@
+menu "App Configuration"
+
+config APP_WIFI_SSID
+    string "Wi-Fi SSID"
+    default "YOUR_WIFI_SSID"
+
+config APP_WIFI_PASS
+    string "Wi-Fi Password"
+    default "YOUR_WIFI_PASSWORD"
+
+config APP_MQTT_URI
+    string "MQTT broker URI (e.g., mqtt://192.168.1.10)"
+    default "mqtt://192.168.1.10"
+
+config APP_MQTT_BASE_TOPIC
+    string "Base MQTT topic for this node"
+    default "ultralights/node"
+
+config APP_LED_GPIO
+    int "WS2812B data GPIO"
+    range 0 21
+    default 0
+
+config APP_LED_COUNT
+    int "Number of LEDs"
+    range 1 3000
+    default 300
+
+config APP_DEFAULT_BRIGHTNESS_PCT
+    int "Default brightness (%)"
+    range 0 100
+    default 100
+
+config APP_OTA_DEFAULT_URL
+    string "Default OTA URL (used by scheduled OTA)"
+    default "https://your.server/firmware.bin"
+
+config APP_OTA_SKIP_CERT_VALIDATION
+    bool "Skip TLS certificate validation (development only)"
+    default n
+
+endmenu
+
+menu "UltraLights OTA"
+
+config APP_DEVICE_ID
+    string "Device ID"
+    default "device123"
+
+config APP_PUBLIC_BASE
+    string "Public base URL"
+    default "https://lights.example.com"
+
+config APP_MANIFEST_PATH
+    string "Manifest path"
+    default "/api/firmware/v1/manifest"
+
+config APP_API_BEARER
+    string "API Bearer token (optional)"
+    default ""
+
+config APP_MANIFEST_HMAC_HEX
+    string "Manifest HMAC secret (hex)"
+    default ""  # put 64 hex chars (32 bytes) when you enable signed manifests
+
+endmenu

@@ -1,0 +1,285 @@
+// main/main.c
+#include <stdio.h>
+#include <string.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/timers.h"
+
+#include "esp_log.h"
+#include "esp_event.h"
+#include "nvs_flash.h"
+
+#include "esp_netif.h"
+#include "esp_wifi.h"
+#include "esp_timer.h"
+#include "mqtt_client.h"
+#include "esp_https_ota.h"
+#include "esp_crt_bundle.h"
+
+#include "effects.h"   // <- this header should include ws2812.h (shared rgb_t)
+#include "ws2812.h"
+
+// ----------------------- sdkconfig params -----------------------
+#define WIFI_SSID           CONFIG_APP_WIFI_SSID
+#define WIFI_PASS           CONFIG_APP_WIFI_PASS
+#define MQTT_URI            CONFIG_APP_MQTT_URI
+#define LED_GPIO            CONFIG_APP_LED_GPIO
+#define LED_COUNT           CONFIG_APP_LED_COUNT
+#define OTA_DEFAULT_URL     CONFIG_APP_OTA_DEFAULT_URL   // may be empty string
+// ----------------------------------------------------------------
+
+static const char *TAG = "APP";
+
+// MQTT topics (keep in sync with your UI/hub)
+static const char *TOPIC_COLOR  = "strip/cmd/color";    // payload: "R,G,B"
+static const char *TOPIC_EFFECT = "strip/cmd/effect";   // payload: effect name
+static const char *TOPIC_SPACEY = "strip/cmd/spacey";   // payload: "r1,g1,b1|r2,g2,b2|r3,g3,b3"
+static const char *TOPIC_OTA    = "strip/cmd/ota";      // payload: URL
+
+// Globals
+static esp_mqtt_client_handle_t s_mqtt = NULL;
+static TimerHandle_t s_ota_timer = NULL;
+static bool s_wifi_connected = false;
+
+// ===================== Utilities =====================
+static void nvs_init_robust(void) {
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(TAG, "NVS needs erase (partition changed); erasing…");
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(err);
+}
+
+static int parse_rgb_csv(const char *s, uint8_t *r, uint8_t *g, uint8_t *b) {
+    int R,G,B;
+    if (sscanf(s, "%d,%d,%d", &R, &G, &B) == 3) {
+        *r = (uint8_t)R; *g = (uint8_t)G; *b = (uint8_t)B;
+        return 1;
+    }
+    return 0;
+}
+
+static int effect_from_name(const char *name, effect_t *out) {
+    if (!name) return 0;
+    if (!strcmp(name,"static")) *out=EFFECT_STATIC;
+    else if (!strcmp(name,"rainbow")) *out=EFFECT_RAINBOW;
+    else if (!strcmp(name,"theater")) *out=EFFECT_THEATER_CHASE;
+    else if (!strcmp(name,"fire")) *out=EFFECT_FIRE;
+    else if (!strcmp(name,"wave")) *out=EFFECT_WAVE;
+    else if (!strcmp(name,"twinkle")) *out=EFFECT_TWINKLE;
+    else if (!strcmp(name,"wipe")) *out=EFFECT_COLOR_WIPE;
+    else if (!strcmp(name,"strobe")) *out=EFFECT_STROBE;
+    else if (!strcmp(name,"breathing")) *out=EFFECT_BREATHING;
+    else if (!strcmp(name,"comet")) *out=EFFECT_COMET;
+    else if (!strcmp(name,"sparkle")) *out=EFFECT_SPARKLE;
+    else if (!strcmp(name,"spacey")) *out=EFFECT_SPACEY_GRADIENT;
+    else return 0;
+    return 1;
+}
+
+// ===================== OTA =====================
+static void do_ota_now(const char *url) {
+    if (!url || !url[0]) {
+        ESP_LOGE(TAG, "OTA URL empty");
+        return;
+    }
+    esp_http_client_config_t http_cfg = {
+        .url = url,
+        .keep_alive_enable = true,
+        .crt_bundle_attach = esp_crt_bundle_attach, // uses ESP-IDF CRT bundle
+    };
+    esp_https_ota_config_t ota_cfg = {
+        .http_config = &http_cfg,
+    };
+    ESP_LOGI(TAG, "OTA: starting -> %s", url);
+    esp_err_t r = esp_https_ota(&ota_cfg);
+    if (r == ESP_OK) {
+        ESP_LOGI(TAG, "OTA success. Rebooting…");
+        vTaskDelay(pdMS_TO_TICKS(300));
+        esp_restart();
+    } else {
+        ESP_LOGE(TAG, "OTA failed: %s", esp_err_to_name(r));
+    }
+}
+
+static void ota_timer_cb(TimerHandle_t xTimer) {
+    (void)xTimer;
+    do_ota_now(OTA_DEFAULT_URL);
+}
+
+// ===================== Effects render task =====================
+static void effect_task(void *arg) {
+    (void)arg;
+    for (;;) {
+        effects_update();               // render one frame
+        vTaskDelay(pdMS_TO_TICKS(30));  // ~33 FPS
+    }
+}
+
+// ===================== MQTT =====================
+static void mqtt_start(void); // fwd decl
+
+static void mqtt_event_handler(void *handler_args,
+                               esp_event_base_t base,
+                               int32_t event_id,
+                               void *event_data)
+{
+    esp_mqtt_event_handle_t e = (esp_mqtt_event_handle_t)event_data;
+
+    switch (event_id) {
+        case MQTT_EVENT_CONNECTED:
+            ESP_LOGI(TAG, "MQTT connected: %s", MQTT_URI);
+            esp_mqtt_client_subscribe(s_mqtt, TOPIC_COLOR, 1);
+            esp_mqtt_client_subscribe(s_mqtt, TOPIC_EFFECT, 1);
+            esp_mqtt_client_subscribe(s_mqtt, TOPIC_SPACEY, 1);
+            esp_mqtt_client_subscribe(s_mqtt, TOPIC_OTA, 1);
+            break;
+
+        case MQTT_EVENT_DATA: {
+            char topic[128] = {0}, data[512] = {0};
+            snprintf(topic, e->topic_len + 1, "%.*s", e->topic_len, e->topic);
+            snprintf(data, e->data_len + 1, "%.*s", e->data_len, e->data);
+            ESP_LOGI(TAG, "MQTT %s -> %s", topic, data);
+
+            if (!strcmp(topic, TOPIC_COLOR)) {
+                uint8_t r,g,b;
+                if (parse_rgb_csv(data,&r,&g,&b)) {
+                    effects_set_static((rgb_t){r,g,b});
+                    effects_set_effect(EFFECT_STATIC);
+                }
+
+            } else if (!strcmp(topic, TOPIC_EFFECT)) {
+                effect_t eff;
+                if (effect_from_name(data,&eff)) {
+                    effects_set_effect(eff);
+                } else {
+                    ESP_LOGW(TAG, "Unknown effect: %s", data);
+                }
+
+            } else if (!strcmp(topic, TOPIC_SPACEY)) {
+                rgb_t a={128,0,255}, b={0,128,255}, c={255,64,0};
+                int ar,ag,ab, br,bg,bb, cr,cg,cb;
+                if (sscanf(data, "%d,%d,%d|%d,%d,%d|%d,%d,%d",
+                           &ar,&ag,&ab, &br,&bg,&bb, &cr,&cg,&cb) == 9) {
+                    a=(rgb_t){(uint8_t)ar,(uint8_t)ag,(uint8_t)ab};
+                    b=(rgb_t){(uint8_t)br,(uint8_t)bg,(uint8_t)bb};
+                    c=(rgb_t){(uint8_t)cr,(uint8_t)cg,(uint8_t)cb};
+                } else {
+                    ESP_LOGW(TAG, "Bad spacey payload, using defaults");
+                }
+                effects_configure_spacey(a,b,c);
+                effects_set_effect(EFFECT_SPACEY_GRADIENT);
+
+            } else if (!strcmp(topic, TOPIC_OTA)) {
+                do_ota_now(data);
+            }
+            break;
+        }
+
+        case MQTT_EVENT_DISCONNECTED:
+            ESP_LOGW(TAG, "MQTT disconnected");
+            break;
+
+        default:
+            break;
+    }
+}
+
+static void mqtt_start(void) {
+    if (!s_wifi_connected) {
+        ESP_LOGW(TAG, "Wi-Fi not ready; delaying MQTT start");
+        return;
+    }
+    if (s_mqtt) return; // already started
+
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .broker.address.uri = MQTT_URI,
+        // For Mosquitto with auth, uncomment and set in sdkconfig or code:
+        // .credentials.username = "lights",
+        // .credentials.authentication.password = "yourpass",
+    };
+    ESP_LOGI(TAG, "Starting MQTT, URI: %s", MQTT_URI);
+    s_mqtt = esp_mqtt_client_init(&mqtt_cfg);
+    ESP_ERROR_CHECK(esp_mqtt_client_register_event(s_mqtt, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_mqtt_client_start(s_mqtt));
+}
+
+// ===================== Wi-Fi / IP events =====================
+static void on_wifi_event(void* arg, esp_event_base_t base, int32_t id, void* data) {
+    switch (id) {
+        case WIFI_EVENT_STA_START:
+            esp_wifi_connect();
+            break;
+        case WIFI_EVENT_STA_DISCONNECTED:
+            s_wifi_connected = false;
+            ESP_LOGW(TAG, "Wi-Fi disconnected, reconnecting…");
+            esp_wifi_connect();
+            break;
+        default: break;
+    }
+}
+
+static void on_ip_event(void* arg, esp_event_base_t base, int32_t id, void* data) {
+    if (id == IP_EVENT_STA_GOT_IP) {
+        s_wifi_connected = true;
+        ESP_LOGI(TAG, "GOT_IP — starting MQTT");
+        mqtt_start();
+    }
+}
+
+static void wifi_start_only(void) {
+    // Assumes esp_netif + default loop + default STA netif already created in app_main().
+    wifi_init_config_t wcfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&wcfg));
+
+    wifi_config_t cfg = { 0 };
+    strncpy((char*)cfg.sta.ssid, WIFI_SSID, sizeof(cfg.sta.ssid));
+    strncpy((char*)cfg.sta.password, WIFI_PASS, sizeof(cfg.sta.password));
+    cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+#if ESP_IDF_VERSION_MAJOR >= 5
+    cfg.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH; // interoperable default
+#endif
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &cfg));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG, "Wi-Fi STA starting… SSID=%s", WIFI_SSID);
+}
+
+// ===================== app_main =====================
+void app_main(void) {
+    // 0) NVS (robust against partition changes)
+    nvs_init_robust();
+
+    // 1) Bring up netif + default event loop BEFORE registering handlers
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+
+    // 2) Register event handlers (now legal)
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &on_wifi_event, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &on_ip_event, NULL));
+
+    // 3) Start Wi-Fi
+    wifi_start_only();
+
+    // 4) LEDs + effects
+    ws2812_init(LED_COUNT, LED_GPIO);   // your led_strip-based wrapper
+    effects_init(LED_COUNT, LED_GPIO);  // internal state
+    effects_set_static((rgb_t){0,0,0}); // default off
+    xTaskCreatePinnedToCore(effect_task, "effect", 4096, NULL, 5, NULL, tskNO_AFFINITY);
+
+    // 5) Optional scheduled OTA (only if URL provided)
+    if (OTA_DEFAULT_URL && OTA_DEFAULT_URL[0]) {
+        s_ota_timer = xTimerCreate("ota", pdMS_TO_TICKS(12*60*60*1000), pdTRUE, NULL, ota_timer_cb);
+        if (s_ota_timer) xTimerStart(s_ota_timer, 0);
+    }
+
+    // 6) Log summary
+    ESP_LOGI(TAG, "Setup complete. LED_COUNT=%d GPIO=%d", LED_COUNT, LED_GPIO);
+    ESP_LOGI(TAG, "MQTT URI: %s", MQTT_URI);
+}

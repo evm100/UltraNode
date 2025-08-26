@@ -1,0 +1,819 @@
+# ==== README.md (overview) =====================================================
+# ESP32-C3 MQTT WS2812B Controller with OTA (ESP-IDF)
+#
+# Features
+# - Drives up to 300 WS2812B (a.k.a. NeoPixel) LEDs using RMT v2
+# - MQTT control for:
+#   • Static color (RGB, optional brightness)
+#   • Effect engine scaffold with pluggable animations (1 sample effect included: "wipe")
+#   • External command to trigger OTA with a provided URL
+# - Scheduled OTA updates (daily at configured HH:MM) — updates can add new effects
+# - Wi‑Fi + SNTP time sync; NVS persistence for OTA schedule
+# - Clean module separation: ws2812, effects, mqtt, ota, time_sync
+#
+# Build
+#   idf.py set-target esp32c3
+#   idf.py menuconfig     # set Wi-Fi, MQTT broker, LED GPIO, etc.
+#   idf.py flash monitor
+#
+# MQTT Topics (base topic is configurable; default: ultralights/strip)
+#  - <base>/cmd/color            payload JSON: {"r":0-255, "g":0-255, "b":0-255, "brightness":0.0-1.0}
+#  - <base>/cmd/effect           payload JSON: {"name":"effectName", "params":{...}}
+#  - <base>/cmd/ota              payload JSON: {"url":"https://host/fw.bin"}
+#  - <base>/cmd/ota_schedule     payload JSON: {"hour":0-23, "minute":0-59, "url":"https://host/fw.bin"}
+#  - <base>/status/online        payload: "1" on connect, "0" on disconnect (LWT)
+#  - <base>/status/info          payload JSON: {firmware, build_time, led_count, ...}
+#  - <base>/status/error         payload text on errors
+#
+# Hardware
+#  - ESP32-C3
+#  - WS2812B data on GPIO (default: GPIO0; change in menuconfig). Use 5V power w/ common ground.
+#
+# Notes
+#  - RMT clock is configured for WS2812 timings; uses a single channel and DMA-like ring buffer.
+#  - Effects engine exposes a registry to add more animations later.
+#
+# ===============================================================================
+
+
+# ==== Project: CMakeLists.txt ==================================================
+cmake_minimum_required(VERSION 3.16)
+include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+project(esp32c3_mqtt_ws2812_ota)
+
+
+# ==== main/CMakeLists.txt ======================================================
+set(PRIV_REQUIRES
+    driver
+    esp_timer
+    nvs_flash
+    esp_wifi
+    esp_netif
+    esp_event
+    esp_adc
+    esp_http_client
+    esp_https_ota
+    app_update
+    mqtt
+    json
+)
+
+idf_component_register(
+    SRCS
+        "main.c"
+        "app_config.c"
+        "wifi_setup.c"
+        "time_sync.c"
+        "ws2812.c"
+        "effects.c"
+        "mqtt_ctrl.c"
+        "ota_update.c"
+    INCLUDE_DIRS "."
+    REQUIRES ${PRIV_REQUIRES}
+)
+
+
+# ==== main/Kconfig.projbuild ===================================================
+menu "App Configuration"
+
+config APP_WIFI_SSID
+    string "Wi-Fi SSID"
+    default "YOUR_WIFI_SSID"
+
+config APP_WIFI_PASS
+    string "Wi-Fi Password"
+    default "YOUR_WIFI_PASSWORD"
+
+config APP_MQTT_BROKER_URL
+    string "MQTT Broker URL (e.g., mqtt://192.168.1.10)"
+    default "mqtt://192.168.1.10"
+
+config APP_MQTT_BASE_TOPIC
+    string "MQTT Base Topic"
+    default "ultralights/strip"
+
+config APP_LED_GPIO
+    int "LED Data GPIO"
+    range 0 21
+    default 0
+
+config APP_LED_COUNT
+    int "Number of LEDs"
+    range 1 3000
+    default 300
+
+config APP_OTA_SKIP_CERT_VALIDATION
+    bool "Skip TLS certificate validation for OTA (DEV ONLY)"
+    default n
+
+config APP_DEFAULT_BRIGHTNESS
+    float "Default brightness (0.0-1.0)"
+    range 0.0 1.0
+    default 1.0
+
+endmenu
+
+
+# ==== main/app_config.h ========================================================
+#pragma once
+#include <stdbool.h>
+#include <stdint.h>
+
+#define APP_FIRMWARE_NAME      "ESP32C3-MQTT-WS2812-OTA"
+#define APP_FIRMWARE_VERSION   "1.0.0"
+
+void app_config_get_wifi(char **ssid, char **pass);
+const char* app_config_get_mqtt_url(void);
+const char* app_config_get_mqtt_base(void);
+int app_config_get_led_gpio(void);
+int app_config_get_led_count(void);
+float app_config_get_default_brightness(void);
+bool app_config_ota_skip_cert_validation(void);
+
+
+// ==== main/app_config.c =======================================================
+#include "app_config.h"
+#include "sdkconfig.h"
+
+void app_config_get_wifi(char **ssid, char **pass) {
+    static char *s = CONFIG_APP_WIFI_SSID;
+    static char *p = CONFIG_APP_WIFI_PASS;
+    *ssid = s; *pass = p;
+}
+
+const char* app_config_get_mqtt_url(void) {
+    return CONFIG_APP_MQTT_BROKER_URL;
+}
+
+const char* app_config_get_mqtt_base(void) {
+    return CONFIG_APP_MQTT_BASE_TOPIC;
+}
+
+int app_config_get_led_gpio(void) {
+    return CONFIG_APP_LED_GPIO;
+}
+
+int app_config_get_led_count(void) {
+    return CONFIG_APP_LED_COUNT;
+}
+
+float app_config_get_default_brightness(void) {
+    return CONFIG_APP_DEFAULT_BRIGHTNESS;
+}
+
+bool app_config_ota_skip_cert_validation(void) {
+    return CONFIG_APP_OTA_SKIP_CERT_VALIDATION;
+}
+
+
+// ==== main/wifi_setup.h =======================================================
+#pragma once
+#include <stdbool.h>
+#include <esp_err.h>
+
+esp_err_t wifi_setup_start(void);
+bool wifi_is_connected(void);
+
+
+// ==== main/wifi_setup.c =======================================================
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "nvs_flash.h"
+#include "esp_netif.h"
+#include "app_config.h"
+
+static const char *TAG = "wifi";
+static EventGroupHandle_t s_wifi_event_group;
+static int s_retry;
+#define WIFI_CONNECTED_BIT BIT0
+
+static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        if (s_retry < 10) {
+            esp_wifi_connect(); s_retry++;
+            ESP_LOGW(TAG, "retry to connect to the AP");
+        }
+        xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        s_retry = 0;
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        ESP_LOGI(TAG, "got ip");
+    }
+}
+
+esp_err_t wifi_setup_start(void) {
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    s_wifi_event_group = xEventGroupCreate();
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
+
+    char *ssid, *pass; app_config_get_wifi(&ssid, &pass);
+
+    wifi_config_t wifi_config = {0};
+    strncpy((char*)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid));
+    strncpy((char*)wifi_config.sta.password, pass, sizeof(wifi_config.sta.password));
+    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(15000));
+    if (!(bits & WIFI_CONNECTED_BIT)) return ESP_FAIL;
+    return ESP_OK;
+}
+
+bool wifi_is_connected(void) {
+    EventBits_t bits = xEventGroupGetBits(s_wifi_event_group);
+    return (bits & WIFI_CONNECTED_BIT);
+}
+
+
+// ==== main/time_sync.h ========================================================
+#pragma once
+void time_sync_start(void);
+int64_t time_sync_now_epoch(void); // seconds since epoch (0 if unsynced)
+
+
+// ==== main/time_sync.c ========================================================
+#include "esp_sntp.h"
+#include "esp_log.h"
+#include <time.h>
+
+static const char *TAG_TS = "time_sync";
+static bool s_synced = false;
+
+static void time_sync_notification_cb(struct timeval *tv) {
+    s_synced = true;
+    ESP_LOGI(TAG_TS, "Time synchronized");
+}
+
+void time_sync_start(void) {
+    sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    sntp_setservername(0, "pool.ntp.org");
+    sntp_set_time_sync_notification_cb(time_sync_notification_cb);
+    sntp_init();
+}
+
+int64_t time_sync_now_epoch(void) {
+    if (!s_synced) return 0;
+    time_t now; time(&now); return (int64_t)now;
+}
+
+
+// ==== main/ws2812.h ===========================================================
+#pragma once
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
+
+typedef struct { uint8_t r,g,b; } rgb_t;
+
+void ws2812_init(int gpio, int led_count);
+void ws2812_set_all(rgb_t c, float brightness);
+void ws2812_set_pixels(const rgb_t *buf, size_t count, float brightness);
+int  ws2812_count(void);
+
+
+// ==== main/ws2812.c ===========================================================
+#include "ws2812.h"
+#include "driver/rmt_tx.h"
+#include "driver/gpio.h"
+#include "esp_log.h"
+#include <string.h>
+
+static const char *TAG_LED = "ws2812";
+static rmt_channel_handle_t s_tx_channel;
+static rmt_encoder_handle_t s_bytes_encoder;
+static rmt_encoder_handle_t s_copy_encoder;
+static int s_led_count = 0;
+
+// WS2812 timing (T0H=0.4us, T0L=0.85us, T1H=0.8us, T1L=0.45us) using 10MHz resolution (0.1us)
+static const rmt_symbol_word_t WS2812_BITS[2] = {
+    // 0 bit
+    {.level0 = 1, .duration0 = 8,  .level1 = 0, .duration1 = 17},
+    // 1 bit
+    {.level0 = 1, .duration0 = 16, .level1 = 0, .duration1 = 9}
+};
+
+// Simple byte encoder: MSB first, GRB order per WS2812
+typedef struct {
+    rmt_encoder_t base;
+    rmt_encoder_handle_t copy_encoder;
+} ws2812_byte_encoder_t;
+
+static size_t ws2812_encode(rmt_encoder_t *enc, rmt_channel_handle_t channel, const void *primary_data, size_t data_size, rmt_encode_state_t *ret_state) {
+    const uint8_t *bytes = (const uint8_t*)primary_data;
+    size_t symbols = 0;
+    for (size_t i = 0; i < data_size; ++i) {
+        uint8_t b = bytes[i];
+        rmt_symbol_word_t tmp[8];
+        for (int bit = 7; bit >= 0; --bit) {
+            tmp[7-bit] = WS2812_BITS[(b >> bit) & 0x1];
+        }
+        rmt_transmit_config_t tx_cfg = { .loop_count = 0 };
+        enc->transmit(enc, channel, tmp, sizeof(tmp), &tx_cfg);
+        symbols += 8;
+    }
+    *ret_state = RMT_ENCODING_COMPLETE;
+    return symbols;
+}
+
+static esp_err_t ws2812_del_encoder(rmt_encoder_t *enc) {
+    ws2812_byte_encoder_t *enc_bytes = __containerof(enc, ws2812_byte_encoder_t, base);
+    if (enc_bytes->copy_encoder) rmt_del_encoder(enc_bytes->copy_encoder);
+    free(enc_bytes);
+    return ESP_OK;
+}
+
+void ws2812_init(int gpio, int led_count) {
+    s_led_count = led_count;
+    rmt_tx_channel_config_t tx_chan_config = {
+        .gpio_num = gpio,
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .resolution_hz = 10 * 1000 * 1000, // 10MHz (0.1us)
+        .mem_block_symbols = 128,
+        .trans_queue_depth = 4,
+    };
+    ESP_ERROR_CHECK(rmt_new_tx_channel(&tx_chan_config, &s_tx_channel));
+
+    ws2812_byte_encoder_t *enc = calloc(1, sizeof(*enc));
+    enc->base.encode = ws2812_encode;
+    enc->base.del = ws2812_del_encoder;
+    s_bytes_encoder = &enc->base;
+    // idle low
+    rmt_transmit_config_t tx_cfg = { .loop_count = 0 };
+    ESP_ERROR_CHECK(rmt_enable(s_tx_channel));
+    ESP_LOGI(TAG_LED, "RMT initialized on GPIO %d for %d LEDs", gpio, s_led_count);
+}
+
+static inline uint8_t apply_brightness(uint8_t v, float b) {
+    if (b >= 0.999f) return v;
+    return (uint8_t)((float)v * (b < 0 ? 0 : (b > 1 ? 1 : b)) + 0.5f);
+}
+
+void ws2812_set_all(rgb_t c, float brightness) {
+    rgb_t *buf = malloc(sizeof(rgb_t) * s_led_count);
+    for (int i = 0; i < s_led_count; ++i) buf[i] = c;
+    ws2812_set_pixels(buf, s_led_count, brightness);
+    free(buf);
+}
+
+void ws2812_set_pixels(const rgb_t *buf, size_t count, float brightness) {
+    // WS2812 expects GRB
+    uint8_t *grb = malloc(count * 3);
+    for (size_t i = 0; i < count; ++i) {
+        grb[3*i+0] = apply_brightness(buf[i].g, brightness);
+        grb[3*i+1] = apply_brightness(buf[i].r, brightness);
+        grb[3*i+2] = apply_brightness(buf[i].b, brightness);
+    }
+    rmt_transmit_config_t tx_cfg = { .loop_count = 0 };
+    rmt_transmit(s_tx_channel, s_bytes_encoder, grb, count*3, &tx_cfg);
+    rmt_tx_wait_all_done(s_tx_channel, pdMS_TO_TICKS(50));
+    // Reset: hold low > 80us, ensured by idle and frame gap
+    vTaskDelay(pdMS_TO_TICKS(1));
+    free(grb);
+}
+
+int ws2812_count(void) { return s_led_count; }
+
+
+// ==== main/effects.h ==========================================================
+#pragma once
+#include "ws2812.h"
+#include <stddef.h>
+#include <stdbool.h>
+
+typedef struct effect_s effect_t;
+
+typedef struct {
+    // Called once when effect is selected (allocate / reset)
+    void (*start)(effect_t*);
+    // Called periodically from an effect task (dt_ms suggested)
+    void (*update)(effect_t*, uint32_t dt_ms);
+    // Optional: apply external params from JSON strings
+    void (*set_param)(effect_t*, const char* key, const char* value);
+    const char *name;
+} effect_vtbl_t;
+
+struct effect_s {
+    effect_vtbl_t vtbl;
+    void *state; // per-effect state bag
+};
+
+void effects_init(float default_brightness);
+void effects_tick(uint32_t dt_ms); // call from task loop when an effect is active
+void effects_set_static(rgb_t c, float brightness);
+void effects_select(const char *name); // e.g., "wipe"
+void effects_set_param(const char* key, const char* value);
+const char* effects_current_name(void);
+
+
+// ==== main/effects.c ==========================================================
+#include "effects.h"
+#include "esp_log.h"
+#include <string.h>
+#include <stdlib.h>
+
+typedef struct {
+    float brightness;
+    bool use_effect;
+} effects_core_t;
+
+static const char *TAG_EFX = "effects";
+static effects_core_t s_core;
+static effect_t s_current;
+
+// ---- Example Effect: "wipe" (simple scaffold) -------------------------------
+typedef struct { int pos; rgb_t color; } wipe_state_t;
+
+static void wipe_start(effect_t *e) {
+    wipe_state_t *st = calloc(1, sizeof(*st));
+    st->pos = 0; st->color = (rgb_t){255,255,255};
+    e->state = st;
+}
+static void wipe_update(effect_t *e, uint32_t dt_ms) {
+    (void)dt_ms;
+    wipe_state_t *st = (wipe_state_t*)e->state;
+    int n = ws2812_count();
+    rgb_t *buf = calloc(n, sizeof(rgb_t));
+    for (int i = 0; i <= st->pos && i < n; ++i) buf[i] = st->color;
+    ws2812_set_pixels(buf, n, s_core.brightness);
+    free(buf);
+    st->pos = (st->pos + 1) % (n+5);
+}
+static void wipe_param(effect_t *e, const char* key, const char* value) {
+    wipe_state_t *st = (wipe_state_t*)e->state;
+    if (!strcmp(key, "color")) {
+        int r,g,b; if (sscanf(value, "%d,%d,%d", &r,&g,&b)==3) st->color=(rgb_t){r,g,b};
+    }
+}
+
+static const effect_vtbl_t EFX_WIPE = {
+    .start = wipe_start,
+    .update = wipe_update,
+    .set_param = wipe_param,
+    .name = "wipe",
+};
+
+// ----------------------------------------------------------------------------
+
+void effects_init(float default_brightness) {
+    s_core.brightness = default_brightness;
+    s_core.use_effect = false;
+}
+
+void effects_tick(uint32_t dt_ms) {
+    if (!s_core.use_effect || !s_current.vtbl.update) return;
+    s_current.vtbl.update(&s_current, dt_ms);
+}
+
+void effects_set_static(rgb_t c, float brightness) {
+    s_core.use_effect = false;
+    if (brightness >= 0.0f) s_core.brightness = brightness;
+    ws2812_set_all(c, s_core.brightness);
+}
+
+void effects_select(const char *name) {
+    if (!name) return;
+    if (!strcmp(name, "wipe")) {
+        s_current.vtbl = EFX_WIPE;
+        if (s_current.vtbl.start) s_current.vtbl.start(&s_current);
+        s_core.use_effect = true;
+        ESP_LOGI(TAG_EFX, "Effect selected: %s", name);
+        return;
+    }
+    ESP_LOGW(TAG_EFX, "Unknown effect: %s", name);
+}
+
+void effects_set_param(const char* key, const char* value) {
+    if (s_core.use_effect && s_current.vtbl.set_param) s_current.vtbl.set_param(&s_current, key, value);
+}
+
+const char* effects_current_name(void) { return s_core.use_effect ? s_current.vtbl.name : "static"; }
+
+
+// ==== main/mqtt_ctrl.h ========================================================
+#pragma once
+#include <stdbool.h>
+#include <esp_err.h>
+
+typedef void (*ota_request_cb_t)(const char* url);
+
+typedef struct {
+    ota_request_cb_t on_ota_now;
+    ota_request_cb_t on_ota_schedule_update; // called with URL; hour/min provided separately
+} mqtt_callbacks_t;
+
+esp_err_t mqtt_ctrl_start(const mqtt_callbacks_t *cbs);
+void mqtt_ctrl_publish_info(void);
+
+
+// ==== main/mqtt_ctrl.c ========================================================
+#include "mqtt_ctrl.h"
+#include "app_config.h"
+#include "effects.h"
+#include "ota_update.h"
+#include "esp_log.h"
+#include "esp_event.h"
+#include "mqtt_client.h"
+#include "cJSON.h"
+#include <string.h>
+
+static const char *TAG_MQTT = "mqtt";
+static esp_mqtt_client_handle_t s_client;
+static mqtt_callbacks_t s_cbs;
+
+static char topic_color[128];
+static char topic_effect[128];
+static char topic_ota[128];
+static char topic_ota_sched[128];
+static char topic_status_online[128];
+static char topic_status_info[128];
+static char topic_status_error[128];
+
+static void make_topics(void) {
+    const char *base = app_config_get_mqtt_base();
+    snprintf(topic_color, sizeof(topic_color), "%s/cmd/color", base);
+    snprintf(topic_effect, sizeof(topic_effect), "%s/cmd/effect", base);
+    snprintf(topic_ota, sizeof(topic_ota), "%s/cmd/ota", base);
+    snprintf(topic_ota_sched, sizeof(topic_ota_sched), "%s/cmd/ota_schedule", base);
+    snprintf(topic_status_online, sizeof(topic_status_online), "%s/status/online", base);
+    snprintf(topic_status_info, sizeof(topic_status_info), "%s/status/info", base);
+    snprintf(topic_status_error, sizeof(topic_status_error), "%s/status/error", base);
+}
+
+static void publish_online(int val) {
+    char buf[2] = { (char)('0'+(val?1:0)), '\0' };
+    esp_mqtt_client_publish(s_client, topic_status_online, buf, 0, 1, true);
+}
+
+void mqtt_ctrl_publish_info(void) {
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "firmware", APP_FIRMWARE_NAME "-" APP_FIRMWARE_VERSION);
+    cJSON_AddNumberToObject(root, "led_count", app_config_get_led_count());
+    cJSON_AddStringToObject(root, "effect", effects_current_name());
+    char *payload = cJSON_PrintUnformatted(root);
+    esp_mqtt_client_publish(s_client, topic_status_info, payload, 0, 1, true);
+    cJSON_free(payload); cJSON_Delete(root);
+}
+
+static void handle_color_json(const char *data, int len) {
+    cJSON *root = cJSON_ParseWithLength(data, len);
+    if (!root) return;
+    int r=0,g=0,b=0; float br=-1.0f;
+    cJSON *jr=cJSON_GetObjectItem(root,"r"), *jg=cJSON_GetObjectItem(root,"g"), *jb=cJSON_GetObjectItem(root,"b");
+    cJSON *jbr=cJSON_GetObjectItem(root,"brightness");
+    if (cJSON_IsNumber(jr)) r=jr->valueint; if (cJSON_IsNumber(jg)) g=jg->valueint; if (cJSON_IsNumber(jb)) b=jb->valueint;
+    if (cJSON_IsNumber(jbr)) br=(float)jbr->valuedouble;
+    effects_set_static((rgb_t){(uint8_t)r,(uint8_t)g,(uint8_t)b}, br);
+    cJSON_Delete(root);
+}
+
+static void handle_effect_json(const char *data, int len) {
+    cJSON *root = cJSON_ParseWithLength(data, len);
+    if (!root) return;
+    cJSON *jn = cJSON_GetObjectItem(root, "name");
+    if (cJSON_IsString(jn)) effects_select(jn->valuestring);
+    cJSON *jp = cJSON_GetObjectItem(root, "params");
+    if (cJSON_IsObject(jp)) {
+        cJSON *c = NULL; cJSON_ArrayForEach(c, jp) {
+            if (cJSON_IsString(c)) effects_set_param(c->string, c->valuestring);
+        }
+    }
+    cJSON_Delete(root);
+}
+
+static void handle_ota_json(const char *data, int len) {
+    cJSON *root = cJSON_ParseWithLength(data, len);
+    if (!root) return;
+    cJSON *ju = cJSON_GetObjectItem(root, "url");
+    if (cJSON_IsString(ju) && s_cbs.on_ota_now) s_cbs.on_ota_now(ju->valuestring);
+    cJSON_Delete(root);
+}
+
+static void handle_ota_sched_json(const char *data, int len) {
+    cJSON *root = cJSON_ParseWithLength(data, len);
+    if (!root) return;
+    cJSON *jh = cJSON_GetObjectItem(root, "hour");
+    cJSON *jm = cJSON_GetObjectItem(root, "minute");
+    cJSON *ju = cJSON_GetObjectItem(root, "url");
+    if (cJSON_IsNumber(jh) && cJSON_IsNumber(jm) && cJSON_IsString(ju)) {
+        ota_schedule_set(jh->valueint, jm->valueint, ju->valuestring);
+        if (s_cbs.on_ota_schedule_update) s_cbs.on_ota_schedule_update(ju->valuestring);
+    }
+    cJSON_Delete(root);
+}
+
+static void mqtt_event_handler(void *arg, esp_event_base_t base, int32_t eid, void *edata) {
+    esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)edata;
+    switch (event->event_id) {
+        case MQTT_EVENT_CONNECTED:
+            ESP_LOGI(TAG_MQTT, "Connected to broker");
+            publish_online(1);
+            esp_mqtt_client_subscribe(s_client, topic_color, 1);
+            esp_mqtt_client_subscribe(s_client, topic_effect, 1);
+            esp_mqtt_client_subscribe(s_client, topic_ota, 1);
+            esp_mqtt_client_subscribe(s_client, topic_ota_sched, 1);
+            mqtt_ctrl_publish_info();
+            break;
+        case MQTT_EVENT_DATA:
+            if (event->topic_len && event->data_len) {
+                char t[128]={0}; memcpy(t, event->topic, event->topic_len);
+                if (!strcmp(t, topic_color)) handle_color_json(event->data, event->data_len);
+                else if (!strcmp(t, topic_effect)) handle_effect_json(event->data, event->data_len);
+                else if (!strcmp(t, topic_ota)) handle_ota_json(event->data, event->data_len);
+                else if (!strcmp(t, topic_ota_sched)) handle_ota_sched_json(event->data, event->data_len);
+            }
+            break;
+        case MQTT_EVENT_DISCONNECTED:
+            publish_online(0);
+            break;
+        default: break;
+    }
+}
+
+esp_err_t mqtt_ctrl_start(const mqtt_callbacks_t *cbs) {
+    s_cbs = *cbs;
+    make_topics();
+
+    esp_mqtt_client_config_t cfg = {
+        .broker.address.uri = app_config_get_mqtt_url(),
+        .session.protocol_ver = MQTT_PROTOCOL_V_3_1_1,
+        .session.last_will = {
+            .topic = topic_status_online,
+            .msg = "0",
+            .msg_len = 1,
+            .qos = 1,
+            .retain = true,
+        },
+    };
+    s_client = esp_mqtt_client_init(&cfg);
+    ESP_ERROR_CHECK(esp_mqtt_client_register_event(s_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL));
+    return esp_mqtt_client_start(s_client);
+}
+
+
+// ==== main/ota_update.h =======================================================
+#pragma once
+#include <stdbool.h>
+#include <esp_err.h>
+
+void ota_init(void);
+void ota_request_now(const char* url);
+void ota_schedule_set(int hour, int minute, const char* url);
+bool ota_schedule_get(int *hour, int *minute, char *url, int url_sz);
+
+
+// ==== main/ota_update.c =======================================================
+#include "ota_update.h"
+#include "app_config.h"
+#include "time_sync.h"
+#include "esp_https_ota.h"
+#include "esp_http_client.h"
+#include "nvs_flash.h"
+#include "nvs.h"
+#include "esp_log.h"
+#include <string.h>
+
+static const char *TAG_OTA = "ota";
+static nvs_handle_t s_nvs;
+static int s_hour = -1, s_minute = -1; static char s_url[256];
+static TaskHandle_t s_sched_task;
+
+static esp_err_t _http_client_init(esp_http_client_handle_t client) {
+#if CONFIG_APP_OTA_SKIP_CERT_VALIDATION
+    return esp_http_client_set_transport_keep_alive(client, true);
+#else
+    (void)client; return ESP_OK;
+#endif
+}
+
+static void do_ota_from_url(const char* url) {
+    ESP_LOGI(TAG_OTA, "Starting OTA: %s", url);
+    esp_https_ota_config_t cfg = {
+        .http_config = &(esp_http_client_config_t){
+            .url = url,
+            .keep_alive_enable = true,
+            .crt_bundle_attach = esp_crt_bundle_attach,
+        },
+        .http_client_init_cb = _http_client_init,
+    };
+#if CONFIG_APP_OTA_SKIP_CERT_VALIDATION
+    cfg.http_config->crt_bundle_attach = NULL; // DEV ONLY
+#endif
+    esp_err_t ret = esp_https_ota(&cfg);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG_OTA, "OTA success, restarting...");
+        vTaskDelay(pdMS_TO_TICKS(500));
+        esp_restart();
+    } else {
+        ESP_LOGE(TAG_OTA, "OTA failed: %s", esp_err_to_name(ret));
+    }
+}
+
+void ota_request_now(const char* url) {
+    if (!url || !url[0]) return;
+    xTaskCreatePinnedToCore(
+        (TaskFunction_t)[](void *arg){ do_ota_from_url((const char*)arg); vPortFree(arg); vTaskDelete(NULL); },
+        "ota_now", 8192, strdup(url), 5, NULL, tskNO_AFFINITY);
+}
+
+void ota_schedule_set(int hour, int minute, const char* url) {
+    s_hour = hour; s_minute = minute; strncpy(s_url, url, sizeof(s_url)-1); s_url[sizeof(s_url)-1]='\0';
+    nvs_set_i32(s_nvs, "hour", s_hour);
+    nvs_set_i32(s_nvs, "minute", s_minute);
+    nvs_set_str(s_nvs, "url", s_url);
+    nvs_commit(s_nvs);
+    ESP_LOGI(TAG_OTA, "Scheduled OTA %02d:%02d -> %s", s_hour, s_minute, s_url);
+}
+
+bool ota_schedule_get(int *hour, int *minute, char *url, int url_sz) {
+    if (s_hour < 0 || s_minute < 0 || s_url[0] == '\0') return false;
+    if (hour) *hour = s_hour; if (minute) *minute = s_minute; if (url) strncpy(url, s_url, url_sz);
+    return true;
+}
+
+static void scheduler_task(void *arg) {
+    int last_day = -1; // ensure first check runs after sync
+    for (;;) {
+        int64_t now = time_sync_now_epoch();
+        if (now > 0 && s_hour >= 0 && s_minute >= 0 && s_url[0]) {
+            struct tm tm_now; time_t tnow = (time_t)now; localtime_r(&tnow, &tm_now);
+            if (tm_now.tm_hour == s_hour && tm_now.tm_min == s_minute && tm_now.tm_mday != last_day) {
+                last_day = tm_now.tm_mday; // avoid duplicate within same day
+                ESP_LOGI(TAG_OTA, "Scheduled time reached, triggering OTA");
+                do_ota_from_url(s_url);
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000 * 30)); // check every 30s
+    }
+}
+
+void ota_init(void) {
+    ESP_ERROR_CHECK(nvs_open("ota", NVS_READWRITE, &s_nvs));
+    int32_t h=-1,m=-1; size_t len=sizeof(s_url); s_url[0]='\0';
+    nvs_get_i32(s_nvs, "hour", &h); nvs_get_i32(s_nvs, "minute", &m); nvs_get_str(s_nvs, "url", s_url, &len);
+    if (h>=0 && m>=0 && s_url[0]) { s_hour=h; s_minute=m; }
+    xTaskCreatePinnedToCore(scheduler_task, "ota_sched", 4096, NULL, 4, &s_sched_task, tskNO_AFFINITY);
+}
+
+
+// ==== main/main.c =============================================================
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h"
+#include "nvs_flash.h"
+#include "app_config.h"
+#include "wifi_setup.h"
+#include "time_sync.h"
+#include "ws2812.h"
+#include "effects.h"
+#include "mqtt_ctrl.h"
+#include "ota_update.h"
+
+static const char *TAG = "app";
+
+static void effect_task(void *arg) {
+    const TickType_t period = pdMS_TO_TICKS(30); // ~33 FPS
+    TickType_t last = xTaskGetTickCount();
+    for (;;) {
+        vTaskDelayUntil(&last, period);
+        effects_tick(30);
+    }
+}
+
+static void on_ota_now(const char* url) { ota_request_now(url); }
+static void on_ota_sched(const char* url) { (void)url; /* already saved in NVS */ }
+
+void app_main(void) {
+    ESP_ERROR_CHECK(nvs_flash_init());
+    ESP_LOGI(TAG, "%s v%s", APP_FIRMWARE_NAME, APP_FIRMWARE_VERSION);
+
+    ESP_ERROR_CHECK(wifi_setup_start());
+    time_sync_start();
+
+    ws2812_init(app_config_get_led_gpio(), app_config_get_led_count());
+    effects_init(app_config_get_default_brightness());
+    effects_set_static((rgb_t){0,0,0}, app_config_get_default_brightness());
+
+    ota_init();
+
+    mqtt_callbacks_t cbs = { .on_ota_now = on_ota_now, .on_ota_schedule_update = on_ota_sched };
+    ESP_ERROR_CHECK(mqtt_ctrl_start(&cbs));
+    mqtt_ctrl_publish_info();
+
+    xTaskCreatePinnedToCore(effect_task, "effect", 4096, NULL, 5, NULL, tskNO_AFFINITY);
+}

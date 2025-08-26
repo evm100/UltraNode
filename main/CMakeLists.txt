@@ -1,0 +1,24 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "app_config.c"
+        "wifi_setup.c"
+        "mqtt_ctrl.c"
+        "ota_update.c"
+        "time_sync.c"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        esp_wifi
+        esp_event
+        esp_netif
+        nvs_flash
+        mqtt
+        esp_http_client
+        esp_https_ota
+        mbedtls
+        json
+        app_update
+        effects
+        ws2812
+)

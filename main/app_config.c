@@ -40,3 +40,75 @@ bool app_config_ota_skip_cert_validation(void) {
 #endif
 }
 
+bool app_config_pir_enabled(void) {
+#ifdef CONFIG_APP_ENABLE_PIR
+    return true;
+#else
+    return false;
+#endif
+}
+
+int app_config_pir_gpio(void) {
+#ifdef CONFIG_APP_ENABLE_PIR
+    return CONFIG_APP_PIR_GPIO;
+#else
+    return -1;
+#endif
+}
+
+bool app_config_ultrasonic_enabled(void) {
+#ifdef CONFIG_APP_ENABLE_ULTRASONIC
+    return true;
+#else
+    return false;
+#endif
+}
+
+int app_config_us_trig_gpio(void) {
+#ifdef CONFIG_APP_ENABLE_ULTRASONIC
+    return CONFIG_APP_US_TRIG_GPIO;
+#else
+    return -1;
+#endif
+}
+
+int app_config_us_echo_gpio(void) {
+#ifdef CONFIG_APP_ENABLE_ULTRASONIC
+    return CONFIG_APP_US_ECHO_GPIO;
+#else
+    return -1;
+#endif
+}
+
+int app_config_us_near_cm(void) {
+#ifdef CONFIG_APP_ENABLE_ULTRASONIC
+    return CONFIG_APP_US_NEAR_CM;
+#else
+    return 0;
+#endif
+}
+
+int app_config_present_brightness_pct(void) {
+#ifdef CONFIG_APP_PRESENT_BRIGHTNESS
+    return CONFIG_APP_PRESENT_BRIGHTNESS;
+#else
+    return 0;
+#endif
+}
+
+int app_config_near_brightness_pct(void) {
+#ifdef CONFIG_APP_NEAR_BRIGHTNESS
+    return CONFIG_APP_NEAR_BRIGHTNESS;
+#else
+    return 0;
+#endif
+}
+
+int app_config_near_extra_leds(void) {
+#ifdef CONFIG_APP_NEAR_EXTRA_LEDS
+    return CONFIG_APP_NEAR_EXTRA_LEDS;
+#else
+    return 0;
+#endif
+}
+

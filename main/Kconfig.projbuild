@@ -64,3 +64,52 @@ config APP_MANIFEST_HMAC_HEX
     default ""  # put 64 hex chars (32 bytes) when you enable signed manifests
 
 endmenu
+
+menu "Presence Sensors"
+
+config APP_ENABLE_PIR
+    bool "Enable PIR motion sensor"
+    default n
+
+config APP_PIR_GPIO
+    int "PIR sensor GPIO"
+    depends on APP_ENABLE_PIR
+    range 0 39
+    default 26
+
+config APP_ENABLE_ULTRASONIC
+    bool "Enable HC-SR04 ultrasonic sensor"
+    default n
+
+config APP_US_TRIG_GPIO
+    int "Ultrasonic trigger GPIO"
+    depends on APP_ENABLE_ULTRASONIC
+    range 0 39
+    default 27
+
+config APP_US_ECHO_GPIO
+    int "Ultrasonic echo GPIO"
+    depends on APP_ENABLE_ULTRASONIC
+    range 0 39
+    default 14
+
+config APP_US_NEAR_CM
+    int "Distance threshold for 'near' (cm)"
+    depends on APP_ENABLE_ULTRASONIC
+    default 50
+
+config APP_PRESENT_BRIGHTNESS
+    int "Brightness when presence detected (%)"
+    range 0 100
+    default 20
+
+config APP_NEAR_BRIGHTNESS
+    int "Brightness when someone is near (%)"
+    range 0 100
+    default 100
+
+config APP_NEAR_EXTRA_LEDS
+    int "Extra LEDs to light when near"
+    default 2
+
+endmenu

@@ -15,6 +15,7 @@
 #include "ws2812.h"
 #include "presence.h"
 
+
 static const char *TAG = "APP";
 
 #define NVS_NS_STATE "state"
@@ -65,6 +66,47 @@ static void mqtt_ota_schedule(int hour, int minute, const char* url) {
     ota_schedule_set(hour, minute, url);
 }
 
+#if CONFIG_APP_ENABLE_PIR || CONFIG_APP_ENABLE_ULTRASONIC
+static uint8_t pct_to_rgb(int pct) {
+    if (pct < 0) pct = 0; if (pct > 100) pct = 100;
+    return (uint8_t)((pct * 255) / 100);
+}
+
+static void presence_cb(presence_state_t st) {
+    uint8_t low = pct_to_rgb(CONFIG_APP_PRESENCE_LOW_BRIGHTNESS_PCT);
+    uint8_t high = pct_to_rgb(CONFIG_APP_PRESENCE_NEAR_BRIGHTNESS_PCT);
+    switch (st) {
+    case PRESENCE_NEAR:
+        effects_set_static((rgb_t){high, high, high});
+#if CONFIG_APP_NEAR_LIGHT1_GPIO >= 0
+        gpio_set_level(CONFIG_APP_NEAR_LIGHT1_GPIO, 1);
+#endif
+#if CONFIG_APP_NEAR_LIGHT2_GPIO >= 0
+        gpio_set_level(CONFIG_APP_NEAR_LIGHT2_GPIO, 1);
+#endif
+        break;
+    case PRESENCE_PRESENT:
+        effects_set_static((rgb_t){low, low, low});
+#if CONFIG_APP_NEAR_LIGHT1_GPIO >= 0
+        gpio_set_level(CONFIG_APP_NEAR_LIGHT1_GPIO, 0);
+#endif
+#if CONFIG_APP_NEAR_LIGHT2_GPIO >= 0
+        gpio_set_level(CONFIG_APP_NEAR_LIGHT2_GPIO, 0);
+#endif
+        break;
+    default:
+        effects_set_static((rgb_t){0,0,0});
+#if CONFIG_APP_NEAR_LIGHT1_GPIO >= 0
+        gpio_set_level(CONFIG_APP_NEAR_LIGHT1_GPIO, 0);
+#endif
+#if CONFIG_APP_NEAR_LIGHT2_GPIO >= 0
+        gpio_set_level(CONFIG_APP_NEAR_LIGHT2_GPIO, 0);
+#endif
+        break;
+    }
+}
+#endif
+
 void app_main(void) {
     nvs_init_robust();
 
@@ -78,6 +120,17 @@ void app_main(void) {
     effects_init(led_count, led_gpio);
     presence_init();
 
+#if CONFIG_APP_NEAR_LIGHT1_GPIO >= 0
+    gpio_reset_pin(CONFIG_APP_NEAR_LIGHT1_GPIO);
+    gpio_set_direction(CONFIG_APP_NEAR_LIGHT1_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(CONFIG_APP_NEAR_LIGHT1_GPIO, 0);
+#endif
+#if CONFIG_APP_NEAR_LIGHT2_GPIO >= 0
+    gpio_reset_pin(CONFIG_APP_NEAR_LIGHT2_GPIO);
+    gpio_set_direction(CONFIG_APP_NEAR_LIGHT2_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(CONFIG_APP_NEAR_LIGHT2_GPIO, 0);
+#endif
+
     effect_t eff; rgb_t col;
     if (state_load(&eff, &col)) {
         effects_set_static_color(col);
@@ -89,6 +142,10 @@ void app_main(void) {
     }
 
     xTaskCreate(effect_task, "effect", 4096, NULL, 5, NULL);
+
+#if CONFIG_APP_ENABLE_PIR || CONFIG_APP_ENABLE_ULTRASONIC
+    presence_init(presence_cb);
+#endif
 
     mqtt_callbacks_t cbs = {
         .on_ota_now = mqtt_ota_now,
